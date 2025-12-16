@@ -1,0 +1,7 @@
+{
+  "name": "Grand Luxury Tree",
+  "description": "A 3D interactive Christmas tree photo viewer controlled by hand gestures.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
