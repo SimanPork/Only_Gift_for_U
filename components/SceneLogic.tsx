@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useRef } from 'react';
 import * as THREE from 'three';
 // @ts-ignore
 import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer';
@@ -16,7 +16,19 @@ interface SceneLogicProps {
   onLoadComplete: () => void;
   onDebugUpdate: (info: string) => void;
   uploadedFiles: File[];
-  isCameraVisible: boolean; // Received from App
+  isCameraVisible: boolean;
+}
+
+// Special Effect State
+type EffectPhase = 'IDLE' | 'RISING' | 'EXPLODED';
+
+// Structure for a single firework streamer (Head + Tail)
+interface ExplosionStreamer {
+  head: THREE.Mesh;
+  trails: THREE.Mesh[];
+  velocity: THREE.Vector3;
+  positionHistory: THREE.Vector3[]; // Stores past positions for trails to follow
+  life: number;
 }
 
 const SceneLogic: React.FC<SceneLogicProps> = ({ onLoadComplete, onDebugUpdate, uploadedFiles, isCameraVisible }) => {
@@ -24,7 +36,7 @@ const SceneLogic: React.FC<SceneLogicProps> = ({ onLoadComplete, onDebugUpdate, 
   const videoRef = useRef<HTMLVideoElement>(null);
   const requestRef = useRef<number>(0);
   
-  // Logic Refs (to persist across renders without causing re-renders)
+  // Logic Refs
   const sceneRef = useRef<THREE.Scene | null>(null);
   const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
@@ -32,7 +44,50 @@ const SceneLogic: React.FC<SceneLogicProps> = ({ onLoadComplete, onDebugUpdate, 
   const mainGroupRef = useRef<THREE.Group | null>(null);
   const photoMeshGroupRef = useRef<THREE.Group | null>(null);
   const particleSystemRef = useRef<Particle[]>([]);
+  
+  // Snow Refs
   const snowSystemRef = useRef<THREE.Points | null>(null);
+  const snowMaterialRef = useRef<THREE.PointsMaterial | null>(null);
+  // Ground Snow Refs
+  const groundSnowSystemRef = useRef<THREE.Points | null>(null);
+  const groundSnowCountRef = useRef<number>(0);
+  const MAX_GROUND_SNOW = 5000;
+  
+  // Special Effects Refs
+  const meteorGroupRef = useRef<THREE.Group | null>(null);
+  const spiralGroupRef = useRef<THREE.Group | null>(null);
+  const explosionGroupRef = useRef<THREE.Group | null>(null);
+  
+  // Effect State
+  const effectStateRef = useRef({
+    phase: 'IDLE' as EffectPhase,
+    spiralHeight: -CONFIG.particles.treeHeight / 2, // Start at bottom
+    snowColorLerp: 0, // 0 = white, 1 = pink
+  });
+  // State tracking for mode changes
+  const prevModeRef = useRef<string>('TREE');
+
+  // Spiral particles data
+  const spiralParticlesData = useRef<{
+    mesh: THREE.Mesh, 
+    lagIndex: number, 
+    offsetR: number, 
+    offsetY: number, 
+    offsetAngle: number
+  }[]>([]);
+  
+  // Explosion Streamers Data
+  const explosionStreamersRef = useRef<ExplosionStreamer[]>([]);
+  
+  // Meteor particles data
+  const meteorsData = useRef<{
+      group: THREE.Group, 
+      head: THREE.Mesh, 
+      tailMat: THREE.MeshBasicMaterial, 
+      speed: number,
+      active: boolean
+  }[]>([]);
+
   const clockRef = useRef(new THREE.Clock());
   const handLandmarkerRef = useRef<HandLandmarker | null>(null);
 
@@ -79,6 +134,19 @@ const SceneLogic: React.FC<SceneLogicProps> = ({ onLoadComplete, onDebugUpdate, 
     const photoMeshGroup = new THREE.Group();
     mainGroup.add(photoMeshGroup);
 
+    // Special Effect Groups
+    const meteorGroup = new THREE.Group();
+    scene.add(meteorGroup); // Add directly to scene
+    meteorGroupRef.current = meteorGroup;
+
+    const spiralGroup = new THREE.Group();
+    mainGroup.add(spiralGroup);
+    spiralGroupRef.current = spiralGroup;
+
+    const explosionGroup = new THREE.Group();
+    scene.add(explosionGroup);
+    explosionGroupRef.current = explosionGroup;
+
     // Environment & Lights
     const pmremGenerator = new THREE.PMREMGenerator(renderer);
     scene.environment = pmremGenerator.fromScene(new RoomEnvironment(), 0.04).texture;
@@ -104,7 +172,7 @@ const SceneLogic: React.FC<SceneLogicProps> = ({ onLoadComplete, onDebugUpdate, 
     const renderScene = new RenderPass(scene, camera);
     const bloomPass = new UnrealBloomPass(new THREE.Vector2(window.innerWidth, window.innerHeight), 1.5, 0.4, 0.85);
     bloomPass.threshold = 0.65;
-    bloomPass.strength = 0.5;
+    bloomPass.strength = 1.0; 
     bloomPass.radius = 0.4;
     const composer = new EffectComposer(renderer);
     composer.addPass(renderScene);
@@ -117,6 +185,10 @@ const SceneLogic: React.FC<SceneLogicProps> = ({ onLoadComplete, onDebugUpdate, 
     composerRef.current = composer;
     mainGroupRef.current = mainGroup;
     photoMeshGroupRef.current = photoMeshGroup;
+
+    initMeteors();
+    initSpiral();
+    initExplosionPool();
   };
 
   const createTextures = () => {
@@ -139,6 +211,374 @@ const SceneLogic: React.FC<SceneLogicProps> = ({ onLoadComplete, onDebugUpdate, 
     caneTexture.repeat.set(3, 3);
     return caneTexture;
   };
+
+  // --- Helper: Create Spiral Texture (Pink Gradient) ---
+  // White Center -> Pink -> Transparent
+  const createSpiralTexture = () => {
+      const canvas = document.createElement('canvas');
+      canvas.width = 32; canvas.height = 32;
+      const ctx = canvas.getContext('2d');
+      if(ctx) {
+          const grad = ctx.createRadialGradient(16, 16, 0, 16, 16, 16);
+          // Center white, edge pinkish
+          grad.addColorStop(0, 'rgba(255, 255, 255, 0.95)');
+          grad.addColorStop(0.3, 'rgba(255, 182, 193, 0.8)'); // LightPink
+          grad.addColorStop(0.6, 'rgba(255, 105, 180, 0.3)'); // HotPink
+          grad.addColorStop(1, 'rgba(0, 0, 0, 0)');
+          ctx.fillStyle = grad;
+          ctx.fillRect(0,0,32,32);
+      }
+      return new THREE.CanvasTexture(canvas);
+  };
+
+  // --- Special Effects Initialization ---
+
+  const initMeteors = () => {
+      if (!meteorGroupRef.current) return;
+      
+      const headGeo = new THREE.SphereGeometry(0.3, 8, 8);
+      const headMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
+
+      const tailHeight = 35;
+      const tailGeo = new THREE.CylinderGeometry(0.4, 0, tailHeight, 8, 2, true);
+      tailGeo.translate(0, -tailHeight/2, 0);
+
+      const vx = -1.2;
+      const vy = -0.8;
+      const angle = Math.atan2(vy, vx); 
+      const rotationZ = angle - Math.PI / 2;
+
+      for(let i=0; i<12; i++) {
+          const group = new THREE.Group();
+          const head = new THREE.Mesh(headGeo, headMat);
+          const tailMat = new THREE.MeshBasicMaterial({ 
+              color: 0x88ccff, 
+              transparent: true, 
+              opacity: 0.0, 
+              blending: THREE.AdditiveBlending,
+              depthWrite: false
+          });
+          const tail = new THREE.Mesh(tailGeo, tailMat);
+          group.add(head);
+          group.add(tail);
+          group.rotation.z = rotationZ;
+          meteorGroupRef.current.add(group);
+          meteorsData.current.push({ group, head, tailMat, speed: 0, active: false });
+      }
+  };
+
+  const initSpiral = () => {
+      if (!spiralGroupRef.current) return;
+      
+      // Use the Pink Gradient texture for the spiral
+      const pinkTexture = createSpiralTexture(); 
+
+      const mat = new THREE.MeshBasicMaterial({ 
+          map: pinkTexture,
+          color: 0xffffff, 
+          transparent: true,
+          opacity: 0.9, 
+          blending: THREE.AdditiveBlending,
+          depthWrite: false,
+          side: THREE.DoubleSide
+      });
+
+      const particleCount = 450; 
+      const geo = new THREE.PlaneGeometry(0.6, 0.6); 
+
+      for(let i=0; i<particleCount; i++) {
+          const mesh = new THREE.Mesh(geo, mat);
+          mesh.visible = false;
+          spiralGroupRef.current.add(mesh);
+          
+          const rOff = (Math.random() - 0.5) * 1.8; 
+          const yOff = (Math.random() - 0.5) * 1.2;
+          const aOff = (Math.random() - 0.5) * 0.2;
+
+          spiralParticlesData.current.push({ 
+              mesh, 
+              lagIndex: i, 
+              offsetR: rOff,
+              offsetY: yOff,
+              offsetAngle: aOff
+          });
+      }
+  };
+
+  const initExplosionPool = () => {
+      if (!explosionGroupRef.current) return;
+      
+      // Use SAME texture as Spiral to match appearance
+      const pinkTexture = createSpiralTexture(); 
+
+      const streamerCount = 300; // Increased count to dense match spiral
+      const trailLength = 5;     // Short trails to keep performance up with high count
+
+      const geo = new THREE.PlaneGeometry(0.6, 0.6); 
+
+      // Single material for all particles (matching spiral)
+      const mat = new THREE.MeshBasicMaterial({
+          map: pinkTexture,
+          color: 0xffffff, // Pure white to let pink texture show
+          transparent: true,
+          opacity: 1.0, 
+          blending: THREE.AdditiveBlending,
+          depthWrite: false,
+          side: THREE.DoubleSide
+      });
+
+      for(let i=0; i<streamerCount; i++) {
+          const head = new THREE.Mesh(geo, mat);
+          head.visible = false;
+          explosionGroupRef.current.add(head);
+
+          const trails: THREE.Mesh[] = [];
+          for(let j=0; j<trailLength; j++) {
+             const tMesh = new THREE.Mesh(geo, mat);
+             tMesh.visible = false;
+             tMesh.scale.setScalar(0.9 - (j/trailLength)*0.7); 
+             explosionGroupRef.current.add(tMesh);
+             trails.push(tMesh);
+          }
+
+          explosionStreamersRef.current.push({
+              head,
+              trails,
+              velocity: new THREE.Vector3(),
+              positionHistory: [],
+              life: 0
+          });
+      }
+  };
+
+  // --- Effects Update Logic ---
+
+  const triggerExplosion = () => {
+      if (!explosionGroupRef.current) return;
+      const topPos = new THREE.Vector3(0, CONFIG.particles.treeHeight/2 + 2, 0);
+      
+      const count = explosionStreamersRef.current.length;
+
+      explosionStreamersRef.current.forEach((streamer, i) => {
+          // Reset
+          streamer.head.position.copy(topPos);
+          streamer.head.visible = true;
+          // Initial size matches spiral particles
+          streamer.head.scale.set(1.2, 1.2, 1.2); 
+          
+          streamer.trails.forEach(t => {
+              t.position.copy(topPos); 
+              t.visible = false; 
+          });
+          streamer.positionHistory = []; 
+
+          // --- HEART SHAPE MATH ---
+          // Heart Equations:
+          // x = 16 sin^3 t
+          // y = 13 cos t - 5 cos 2t - 2 cos 3t - cos 4t
+          // Range Y is approx [-17, 13]
+          // Range X is approx [-16, 16]
+          
+          let vx, vy, vz;
+          
+          // Randomize speed slightly for natural look
+          // Lower speed multiplier means shape stays tighter, higher means bigger burst
+          // To reach middle of tree (y=0) from top (y=12), we need a drop of ~12 units.
+          // The bottom of heart is -17 units in eq.
+          // Scale factor approx 0.8
+          const speedScale = 0.8 + Math.random() * 0.4; 
+
+          if (i < count * 0.9) { 
+              // 90% form the Heart Shape
+              const t = (i / (count * 0.9)) * Math.PI * 2;
+              
+              // Raw Parametric Coords
+              const rawX = 16 * Math.pow(Math.sin(t), 3);
+              const rawY = 13 * Math.cos(t) - 5 * Math.cos(2*t) - 2 * Math.cos(3*t) - Math.cos(4*t);
+              
+              // We map these coords directly to velocity
+              // We also shift Y up slightly so the "center" of the burst isn't too low immediately
+              
+              vx = rawX * speedScale;
+              vy = (rawY + 5) * speedScale; // +5 to center the heart vertically around origin before velocity takes over
+              
+              // Add Z depth for 3D volume
+              vz = (Math.random() - 0.5) * 8.0;
+
+          } else {
+              // 10% Random Fill inside
+              const theta = Math.random() * Math.PI * 2;
+              const phi = Math.random() * Math.PI;
+              const r = Math.random() * 10; 
+              
+              vx = r * Math.sin(phi) * Math.cos(theta);
+              vy = r * Math.sin(phi) * Math.sin(theta);
+              vz = r * Math.cos(phi);
+          }
+
+          streamer.velocity.set(vx, vy, vz);
+          
+          streamer.life = 3.5; // Longer life for slow fall
+      });
+  };
+
+  const updateSpecialEffects = (dt: number, mode: string, elapsedTime: number) => {
+      const cameraPos = cameraRef.current?.position || new THREE.Vector3(0,0,50);
+
+      // 1. Meteors
+      if (mode === 'TREE') {
+          meteorsData.current.forEach((data, i) => {
+              if (data.active) {
+                  const vx = -1.2;
+                  const vy = -0.8;
+                  data.group.position.x += vx * data.speed * dt;
+                  data.group.position.y += vy * data.speed * dt;
+                  const flicker = 0.3 + Math.abs(Math.sin(elapsedTime * 30 + i * 10)) * 0.5;
+                  data.tailMat.opacity = flicker;
+                  if (data.group.position.y < -60 || data.group.position.x < -100) {
+                      data.active = false;
+                      data.group.visible = false;
+                  }
+              } else {
+                  if (Math.random() < 0.02) {
+                      data.active = true;
+                      data.group.visible = true;
+                      const startX = 30 + Math.random() * 50;
+                      const startY = 40 + Math.random() * 40;
+                      const startZ = -40 - Math.random() * 60;
+                      data.group.position.set(startX, startY, startZ);
+                      data.speed = 35 + Math.random() * 20; 
+                      data.tailMat.opacity = 0; 
+                  }
+              }
+          });
+      } else {
+          meteorsData.current.forEach(d => { d.active = false; d.group.visible = false; });
+      }
+
+      // 2. Spiral Beam
+      if (mode === 'TREE') {
+          if (effectStateRef.current.phase === 'IDLE') {
+              effectStateRef.current.phase = 'RISING';
+              effectStateRef.current.spiralHeight = -CONFIG.particles.treeHeight/2;
+          }
+
+          if (effectStateRef.current.phase === 'RISING') {
+              effectStateRef.current.spiralHeight += 8.0 * dt; 
+              
+              const currentHeadY = effectStateRef.current.spiralHeight;
+              const maxH = CONFIG.particles.treeHeight/2 + 2;
+              const totalParticles = spiralParticlesData.current.length;
+              
+              const spinRate = 2.0; 
+              const baseHeadAngle = currentHeadY * spinRate + elapsedTime * 2;
+              
+              spiralParticlesData.current.forEach((p) => {
+                   const trailRatio = p.lagIndex / totalParticles;
+                   const lagDistance = trailRatio * 20.0; 
+                   const myBaseY = currentHeadY - (lagDistance * 0.6); 
+                   const myBaseAngle = baseHeadAngle - (lagDistance * 0.5); 
+
+                   if (myBaseY > -CONFIG.particles.treeHeight/2 && myBaseY < maxH) {
+                       p.mesh.visible = true;
+                       const progress = (myBaseY + CONFIG.particles.treeHeight/2) / CONFIG.particles.treeHeight;
+                       const baseRadius = 9.0 * (1.0 - progress * 0.85); 
+                       
+                       const r = baseRadius + p.offsetR; 
+                       const y = myBaseY + p.offsetY;     
+                       const angle = myBaseAngle + p.offsetAngle;
+
+                       p.mesh.position.set(Math.cos(angle) * r, y, Math.sin(angle) * r);
+                       p.mesh.lookAt(cameraPos);
+
+                       const sparkle = 1.0 + Math.sin(elapsedTime * 10 + p.lagIndex) * 0.3;
+                       const sizeFade = Math.max(0, 1.0 - trailRatio); 
+                       const s = sizeFade * 2.0 * sparkle; 
+                       p.mesh.scale.set(s, s, s);
+                   } else {
+                       p.mesh.visible = false;
+                   }
+              });
+
+              if (currentHeadY > maxH) {
+                  effectStateRef.current.phase = 'EXPLODED';
+                  triggerExplosion();
+                  spiralParticlesData.current.forEach(p => p.mesh.visible = false);
+              }
+          }
+      } else {
+          effectStateRef.current.phase = 'IDLE';
+          effectStateRef.current.snowColorLerp = 0; 
+          spiralParticlesData.current.forEach(p => p.mesh.visible = false);
+          
+          // Hide Explosion
+          explosionStreamersRef.current.forEach(s => {
+              s.head.visible = false;
+              s.trails.forEach(t => t.visible = false);
+          });
+      }
+
+      // 3. Explosion Animation (Heart Firework Style)
+      if (effectStateRef.current.phase === 'EXPLODED') {
+          // Keep pinkish ambience
+          effectStateRef.current.snowColorLerp = THREE.MathUtils.lerp(effectStateRef.current.snowColorLerp, 1, dt * 2);
+
+          const gravity = new THREE.Vector3(0, -5, 0); // Moderate gravity
+          const drag = 0.98; // Low drag for expansion
+
+          explosionStreamersRef.current.forEach(streamer => {
+              if (streamer.life > 0) {
+                  // Update Head Physics
+                  streamer.velocity.addScaledVector(gravity, dt);
+                  streamer.velocity.multiplyScalar(drag); 
+                  
+                  streamer.head.position.addScaledVector(streamer.velocity, dt);
+                  streamer.head.lookAt(cameraPos);
+                  
+                  // Record history for trails
+                  streamer.positionHistory.unshift(streamer.head.position.clone());
+                  if (streamer.positionHistory.length > streamer.trails.length + 2) {
+                      streamer.positionHistory.pop();
+                  }
+
+                  // Update Trails
+                  streamer.trails.forEach((t, index) => {
+                      const histIndex = index; 
+                      if (streamer.positionHistory[histIndex]) {
+                          t.visible = true;
+                          t.position.copy(streamer.positionHistory[histIndex]);
+                          t.lookAt(cameraPos);
+                          
+                          // Fade tail based on life
+                          const lifeRatio = streamer.life / 3.5; 
+                          const trailFade = 1.0 - (index / streamer.trails.length);
+                          
+                          const s = 1.2 * lifeRatio * trailFade;
+                          t.scale.set(s, s, s);
+
+                          // Keep opacity high enough to see trails clearly
+                          (t.material as THREE.MeshBasicMaterial).opacity = lifeRatio * trailFade;
+                      }
+                  });
+
+                  // Head Scale
+                  const headScale = 1.5 * (streamer.life / 3.5);
+                  streamer.head.scale.set(headScale, headScale, headScale);
+                  (streamer.head.material as THREE.MeshBasicMaterial).opacity = streamer.life / 3.5;
+
+                  streamer.life -= dt;
+                  if (streamer.life <= 0) {
+                      streamer.head.visible = false;
+                      streamer.trails.forEach(t => t.visible = false);
+                  }
+              }
+          });
+      } else {
+          if (mode !== 'TREE') effectStateRef.current.snowColorLerp = 0;
+      }
+  };
+
+  // --- Main Scene Logic ---
 
   const updatePhotoLayout = () => {
     const photos = particleSystemRef.current.filter(p => p.type === 'PHOTO');
@@ -288,7 +728,7 @@ const SceneLogic: React.FC<SceneLogicProps> = ({ onLoadComplete, onDebugUpdate, 
         const yNorm = Math.random();
         const y = (yNorm - 0.5) * h;
         const rAtHeight = (1.0 - yNorm) * rBase;
-        const r = rAtHeight * (0.8 + Math.random() * 0.4); // Add some noise to radius
+        const r = rAtHeight * (0.8 + Math.random() * 0.4); 
         const angle = Math.random() * Math.PI * 2;
 
         p.posTree.set(
@@ -383,8 +823,10 @@ const SceneLogic: React.FC<SceneLogicProps> = ({ onLoadComplete, onDebugUpdate, 
     const sCtx = snowCanvas.getContext('2d');
     if(sCtx) {
         sCtx.fillStyle = 'white';
+        sCtx.shadowBlur = 10;
+        sCtx.shadowColor = 'white';
         sCtx.beginPath();
-        sCtx.arc(16, 16, 16, 0, Math.PI * 2);
+        sCtx.arc(16, 16, 10, 0, Math.PI * 2);
         sCtx.fill();
     }
     const snowTexture = new THREE.CanvasTexture(snowCanvas);
@@ -402,17 +844,32 @@ const SceneLogic: React.FC<SceneLogicProps> = ({ onLoadComplete, onDebugUpdate, 
 
     const snowMat = new THREE.PointsMaterial({
         color: 0xffffff,
-        size: 0.4,
+        size: 0.5,
         map: snowTexture,
         transparent: true,
-        opacity: 0.8,
+        opacity: 0.9,
         blending: THREE.AdditiveBlending,
-        depthWrite: false
+        depthWrite: false,
+        sizeAttenuation: true
     });
 
     const snow = new THREE.Points(snowGeo, snowMat);
     if(sceneRef.current) sceneRef.current.add(snow);
     snowSystemRef.current = snow;
+    snowMaterialRef.current = snowMat;
+
+    // --- Ground Snow Init ---
+    const groundSnowGeo = new THREE.BufferGeometry();
+    const groundVertices: number[] = [];
+    // Initialize max ground snow particles off-screen
+    for(let i=0; i<MAX_GROUND_SNOW; i++) {
+        groundVertices.push(0, -1000, 0);
+    }
+    groundSnowGeo.setAttribute('position', new THREE.Float32BufferAttribute(groundVertices, 3));
+    
+    const groundSnow = new THREE.Points(groundSnowGeo, snowMat); // Use same material
+    if(sceneRef.current) sceneRef.current.add(groundSnow);
+    groundSnowSystemRef.current = groundSnow;
   };
 
   const loadPredefinedImages = () => {
@@ -426,12 +883,24 @@ const SceneLogic: React.FC<SceneLogicProps> = ({ onLoadComplete, onDebugUpdate, 
     });
   };
 
-  const updateSnow = (elapsedTime: number) => {
-    if (!snowSystemRef.current) return;
+  const updateSnow = (elapsedTime: number, mode: string) => {
+    if (!snowSystemRef.current || !snowMaterialRef.current) return;
     
     const positions = snowSystemRef.current.geometry.attributes.position.array as Float32Array;
     const userData = snowSystemRef.current.geometry.attributes.userData.array as Float32Array;
 
+    // 1. Dynamic Color Changing (White <-> Pink)
+    const pink = new THREE.Color(0xffb7c5); // Pastel pink
+    const white = new THREE.Color(0xffffff);
+    snowMaterialRef.current.color.copy(white).lerp(pink, effectStateRef.current.snowColorLerp);
+
+    // 2. Stable Snow (No flickering)
+    snowMaterialRef.current.opacity = 0.8;
+    snowMaterialRef.current.size = 0.5;
+
+    // Ground Snow Accumulation Logic
+    const bottomThreshold = -30;
+    
     for (let i = 0; i < CONFIG.particles.snowCount; i++) {
         // Y fall
         const fallSpeed = userData[i * 2];
@@ -441,8 +910,40 @@ const SceneLogic: React.FC<SceneLogicProps> = ({ onLoadComplete, onDebugUpdate, 
         const swaySpeed = userData[i * 2 + 1];
         positions[i * 3] += Math.sin(elapsedTime * 2 + i) * swaySpeed * 0.1;
 
-        // Reset
-        if (positions[i * 3 + 1] < -30) {
+        // Reset & Accumulate
+        if (positions[i * 3 + 1] < bottomThreshold) {
+            
+            // If in TREE mode, try to add to pile
+            if (mode === 'TREE' && groundSnowSystemRef.current && groundSnowCountRef.current < MAX_GROUND_SNOW) {
+                 const currentCount = groundSnowCountRef.current;
+                 const groundPositions = groundSnowSystemRef.current.geometry.attributes.position.array as Float32Array;
+                 
+                 // Get current x, z of falling flake (and clamp to pile width)
+                 // Or generate random spread for better visuals
+                 const width = 80;
+                 const x = THREE.MathUtils.randFloatSpread(width);
+                 const z = THREE.MathUtils.randFloatSpread(50);
+                 
+                 // Pile Height Calculation:
+                 // 1. Random base variation
+                 // 2. Grow based on total count
+                 // 3. Taller in center (using Cosine or Parabola)
+                 const normX = x / (width/2); // -1 to 1
+                 const shapeFactor = Math.max(0, Math.cos(normX * Math.PI / 1.5)); // 1 at center, 0 at edges
+                 const pileHeight = shapeFactor * 5 + Math.random() * 2;
+                 const growFactor = (currentCount / MAX_GROUND_SNOW) * 3; // Grows up to 3 units
+
+                 const y = bottomThreshold + 2 + pileHeight * 0.5 + growFactor;
+
+                 groundPositions[currentCount * 3] = x;
+                 groundPositions[currentCount * 3 + 1] = y;
+                 groundPositions[currentCount * 3 + 2] = z;
+
+                 groundSnowCountRef.current++;
+                 groundSnowSystemRef.current.geometry.attributes.position.needsUpdate = true;
+            }
+
+            // Respawn Falling Flake at top
             positions[i * 3 + 1] = 30;
             positions[i * 3] = THREE.MathUtils.randFloatSpread(100);
             positions[i * 3 + 2] = THREE.MathUtils.randFloatSpread(60);
@@ -513,6 +1014,20 @@ const SceneLogic: React.FC<SceneLogicProps> = ({ onLoadComplete, onDebugUpdate, 
         const elapsedTime = clockRef.current.elapsedTime;
         const state = stateRef.current;
 
+        // Reset Ground Snow Check
+        if (state.mode === 'TREE' && prevModeRef.current !== 'TREE') {
+            // Reset pile
+            groundSnowCountRef.current = 0;
+            if (groundSnowSystemRef.current) {
+                const positions = groundSnowSystemRef.current.geometry.attributes.position.array as Float32Array;
+                for(let i=0; i<MAX_GROUND_SNOW; i++) {
+                    positions[i*3+1] = -1000; // Hide below screen
+                }
+                groundSnowSystemRef.current.geometry.attributes.position.needsUpdate = true;
+            }
+        }
+        prevModeRef.current = state.mode;
+
         // Rotation Logic
         if (state.mode === 'SCATTER' && state.hand.detected) {
             const targetRotY = state.hand.x * Math.PI * 0.9; 
@@ -532,7 +1047,6 @@ const SceneLogic: React.FC<SceneLogicProps> = ({ onLoadComplete, onDebugUpdate, 
             mainGroupRef.current.rotation.y = state.rotation.y;
             mainGroupRef.current.rotation.x = state.rotation.x;
             
-            // Pass world matrix and camera pos for focus calc
             mainGroupRef.current.updateMatrixWorld();
             const worldMat = mainGroupRef.current.matrixWorld;
             const camPos = cameraRef.current?.position || new THREE.Vector3(0,0,50);
@@ -540,7 +1054,8 @@ const SceneLogic: React.FC<SceneLogicProps> = ({ onLoadComplete, onDebugUpdate, 
             particleSystemRef.current.forEach(p => p.update(dt, state.mode, state.focusTarget, worldMat, camPos, elapsedTime));
         }
 
-        updateSnow(elapsedTime);
+        updateSpecialEffects(dt, state.mode, elapsedTime);
+        updateSnow(elapsedTime, state.mode);
         if(composerRef.current) composerRef.current.render();
     };
 

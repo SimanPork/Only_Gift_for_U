@@ -14,12 +14,12 @@ export const CONFIG = {
       treeRadius: 8
     },
     camera: { z: 50 },
+    audio: {
+      // 默认音乐：Silent Night (钢琴版)
+      // 如果需要更换，请直接在界面右上角点击音乐图标上传您的MP3文件
+      bgmUrl: 'https://upload.wikimedia.org/wikipedia/commons/transcoded/6/6d/Silent_Night_-_piano.ogg/Silent_Night_-_piano.ogg.mp3'
+    },
     preload: {
-      images: [
-        'https://images.unsplash.com/photo-1543589077-47d81606c1bf?q=80&w=600',
-        'https://images.unsplash.com/photo-1576919228236-a097c32a5cd4?q=80&w=600',
-        'https://images.unsplash.com/photo-1512389142860-9c449e58a543?q=80&w=600',
-        'https://images.unsplash.com/photo-1512389142860-9c449e58a543?q=80&w=600'
-      ]
+      images: []
     }
   };

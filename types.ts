@@ -16,6 +16,9 @@ export interface AppConfig {
     treeRadius: number;
   };
   camera: { z: number };
+  audio: {
+    bgmUrl: string;
+  };
 }
 
 export interface AppState {
