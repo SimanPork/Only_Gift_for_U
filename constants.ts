@@ -3,7 +3,8 @@ export const CONFIG = {
       bg: 0x050d1a,
       fog: 0x050d1a,
       champagneGold: 0xffd966,
-      deepGreen: 0x03180a,
+      deepGreen: 0x032210, // 稍微调亮一点点的深墨绿，更有质感
+      brightGreen: 0x44aa44, // 新增：明亮的草绿色/圣诞绿
       accentRed: 0x990000,
     },
     particles: {

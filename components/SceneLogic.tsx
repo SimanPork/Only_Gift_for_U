@@ -356,6 +356,16 @@ const SceneLogic: React.FC<SceneLogicProps> = ({ onLoadComplete, onDebugUpdate, 
   const triggerExplosion = () => {
       if (!explosionGroupRef.current) return;
       const topPos = new THREE.Vector3(0, CONFIG.particles.treeHeight/2 + 2, 0);
+
+      // Reset Ground Snow immediately when tree opens (Explosion start)
+      groundSnowCountRef.current = 0;
+      if (groundSnowSystemRef.current) {
+          const positions = groundSnowSystemRef.current.geometry.attributes.position.array as Float32Array;
+          for(let k=0; k<MAX_GROUND_SNOW; k++) {
+              positions[k*3+1] = -1000;
+          }
+          groundSnowSystemRef.current.geometry.attributes.position.needsUpdate = true;
+      }
       
       const count = explosionStreamersRef.current.length;
 
@@ -670,11 +680,20 @@ const SceneLogic: React.FC<SceneLogicProps> = ({ onLoadComplete, onDebugUpdate, 
         emissiveIntensity: 0.3
     });
 
+    // Deep Green Material (Darker)
     const greenMat = new THREE.MeshStandardMaterial({
         color: CONFIG.colors.deepGreen,
         metalness: 0.2, roughness: 0.8,
         emissive: 0x002200,
         emissiveIntensity: 0.2 
+    });
+
+    // Bright Green Material (Lighter/New)
+    const brightGreenMat = new THREE.MeshStandardMaterial({
+        color: CONFIG.colors.brightGreen,
+        metalness: 0.2, roughness: 0.8,
+        emissive: 0x003300,
+        emissiveIntensity: 0.2
     });
 
     const redMat = new THREE.MeshPhysicalMaterial({
@@ -690,8 +709,12 @@ const SceneLogic: React.FC<SceneLogicProps> = ({ onLoadComplete, onDebugUpdate, 
         let mesh: THREE.Mesh;
         let type: ParticleType;
         
-        if (rand < 0.40) {
-            mesh = new THREE.Mesh(boxGeo, greenMat);
+        // Split the original 40% chance for green boxes into two types
+        if (rand < 0.20) {
+            mesh = new THREE.Mesh(boxGeo, greenMat); // Deep Green
+            type = 'BOX';
+        } else if (rand < 0.40) {
+            mesh = new THREE.Mesh(boxGeo, brightGreenMat); // Bright Green
             type = 'BOX';
         } else if (rand < 0.70) {
             mesh = new THREE.Mesh(boxGeo, goldMat);
